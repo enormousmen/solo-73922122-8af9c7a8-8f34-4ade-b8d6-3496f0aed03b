@@ -31,6 +31,7 @@ from .trainer import (
     NotFoundError,
     PauseTimeoutError,
 )
+from .checkpoint import CheckpointLoadError
 
 manager: JobManager
 
@@ -126,12 +127,23 @@ async def pause() -> dict:
 
 @app.post("/train/resume")
 def resume() -> dict:
-    """Resume from the paused state / latest checkpoint. Only one trainer can
-    run at a time: concurrent resumes yield exactly one 200 and 409s."""
+    """Resume a paused or failed run.
+
+    * Paused: continue the in-memory scene (at least as new as disk).
+    * Failed: discard the contaminated in-memory scene and fully restore the
+      latest successful checkpoint of the SAME run before any training starts.
+      Refused with 404 when no usable checkpoint exists, and 503 when the
+      checkpoint cannot be loaded/restored (the original checkpoint is kept
+      and the reason stays queryable via GET /train/status).
+    Only one trainer can run at a time: concurrent resumes yield exactly one
+    200 and 409s (a second call during recovery sees state ``recovering``).
+    """
     try:
         return manager.resume()
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except CheckpointLoadError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ConflictError as exc:
         raise _conflict(exc) from exc
 
@@ -156,6 +168,8 @@ def parameters() -> Response:
         data = manager.read_parameters()
     except NotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except CheckpointLoadError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return Response(
         content=data,
         media_type="application/octet-stream",

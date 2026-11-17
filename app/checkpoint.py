@@ -1,4 +1,4 @@
-"""Atomic checkpoint persistence.
+"""Atomic checkpoint persistence and strict loading.
 
 A checkpoint is a single ``checkpoint.pt`` file inside the runs directory.
 Saves are atomic on POSIX filesystems:
@@ -13,10 +13,19 @@ the complete previous checkpoint or the complete new one — never a torn file.
 A failed save (e.g. disk full) leaves the previous checkpoint untouched so it
 can be used for a retry or for recovery after a restart.
 
-TEST-ONLY HOOK: if a file named ``INJECT_SAVE_FAILURES`` exists in the runs
-directory, every save fails *before touching anything* (the old checkpoint
-stays intact).  ``scripts/verify_repro.py`` uses this to exercise the
-save-failure path; it is never present in normal operation.
+Loading never mutates or removes the file: an unreadable / corrupt checkpoint
+raises :class:`CheckpointLoadError` and leaves the original bytes in place so
+the failure reason stays queryable and the file can be inspected or retried.
+
+TEST-ONLY HOOKS (used by scripts/verify_repro.py, never present in normal
+operation; all driven by marker files in the runs directory):
+
+* ``INJECT_SAVE_FAILURES``       - every save fails before touching anything.
+* ``INJECT_LOAD_FAILURES``       - every checkpoint load raises
+  :class:`CheckpointLoadError` (the file itself is kept).
+* ``INJECT_LOAD_DELAY_SECONDS``  - sleep N seconds inside a load, to prove
+  that a slow recovery never blocks status queries.
+* ``INJECT_BATCH_FAILURE_AT``    - handled by the trainer (see trainer.py).
 """
 from __future__ import annotations
 
@@ -29,10 +38,20 @@ import torch
 
 CHECKPOINT_FILENAME = "checkpoint.pt"
 INJECT_FAILURES_FILENAME = "INJECT_SAVE_FAILURES"
+INJECT_LOAD_FAILURES_FILENAME = "INJECT_LOAD_FAILURES"
+INJECT_LOAD_DELAY_FILENAME = "INJECT_LOAD_DELAY_SECONDS"
 
 
 class CheckpointError(IOError):
     """Raised when a checkpoint could not be persisted."""
+
+
+class CheckpointLoadError(IOError):
+    """Raised when an existing checkpoint cannot be read/parsed.
+
+    The original checkpoint file is deliberately left untouched, so callers
+    can surface a queryable failure reason and retry later.
+    """
 
 
 def checkpoint_path(runs_dir) -> Path:
@@ -76,15 +95,53 @@ def save_checkpoint(runs_dir, payload: dict, save_delay_seconds: float = 0.0) ->
     return final
 
 
+def _injected_load_delay(runs: Path) -> None:
+    delay_file = runs / INJECT_LOAD_DELAY_FILENAME
+    if not delay_file.is_file():
+        return
+    try:
+        delay = float(delay_file.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return
+    if delay > 0:
+        time.sleep(delay)
+
+
 def load_checkpoint(runs_dir) -> dict | None:
     """Load the checkpoint if one exists; ``None`` otherwise.
 
     Only complete checkpoints can be observed thanks to the atomic rename.
+    A present-but-unreadable file raises :class:`CheckpointLoadError`; the
+    file is never deleted or truncated by this function.
     """
-    final = checkpoint_path(runs_dir)
+    runs = Path(runs_dir)
+    final = checkpoint_path(runs)
     if not final.exists():
         return None
-    return torch.load(final, map_location="cpu", weights_only=True)
+
+    # --- test-only fault injection (see module docstring) ---
+    if (runs / INJECT_LOAD_FAILURES_FILENAME).exists():
+        raise CheckpointLoadError(
+            f"checkpoint load failed: injected fault "
+            f"('{INJECT_LOAD_FAILURES_FILENAME}' file present in {runs}); "
+            f"original checkpoint kept at {final}"
+        )
+    _injected_load_delay(runs)
+    # ---------------------------------------------------------
+
+    try:
+        obj = torch.load(final, map_location="cpu", weights_only=True)
+    except Exception as exc:  # noqa: BLE001 - any parse failure is a load error
+        raise CheckpointLoadError(
+            f"checkpoint at {final} is unreadable or corrupt: {exc!r}; "
+            f"the original file was kept at {final} and can be retried"
+        ) from exc
+    if not isinstance(obj, dict):
+        raise CheckpointLoadError(
+            f"checkpoint at {final} has unexpected top-level type "
+            f"{type(obj).__name__}; original file kept"
+        )
+    return obj
 
 
 def cleanup_stale_tmp_files(runs_dir) -> list[str]:
